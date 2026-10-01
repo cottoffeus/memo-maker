@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+*.part
+# иконки рисует приложение при первом запуске
+memo_maker.ico
+memo_maker_busy.ico

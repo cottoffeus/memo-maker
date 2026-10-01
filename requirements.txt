@@ -1,0 +1,8 @@
+# Python 3.12: py -3.12 -m pip install -r requirements.txt
+faster-whisper>=1.2
+# библиотеки CUDA для работы на видеокарте NVIDIA
+nvidia-cublas-cu12>=12.9
+nvidia-cudnn-cu12>=9.20
+pystray>=0.19
+Pillow>=12.0
+sv-ttk>=2.6
