@@ -9,6 +9,16 @@
 скилл meeting-memo, мемо делается по нему. О каждом завершении приходит
 уведомление Windows.
 
+Последний шаг по желанию: сжатие записи в H.265 на видеокарте через ffmpeg.
+Сжатый файл "<имя> (H.265).mp4" кладётся рядом с записью, оригинал по желанию
+удаляется после проверки сжатого. Сжатие идёт после транскрибации, потому что
+Whisper слушает только звук, а звук при сжатии копируется без изменений: текст
+от порядка не зависит, а транскрипция и мемо приходят без задержки. Видеокарту
+сжатие уступает: ждёт, пока OBS пишет новую запись или открыто окно новой
+записи, и пропускает вперёд встречи, которым нужна транскрибация или мемо.
+Если такое случилось посреди сжатия, ffmpeg останавливается, а сжатие потом
+начинается заново.
+
 Запуск без консольного окна:
     pyw -3.12 memo_maker.pyw
 
@@ -84,10 +94,22 @@ IDLE_GRADIENT = ((64, 156, 255), (79, 70, 229))
 BUSY_GRADIENT = ((255, 166, 72), (234, 88, 12))
 
 MODES = {"fast": "Быстро", "gentle": "Щадяще"}
-STATUS = {"waiting": "в очереди", "transcribing": "транскрибация", "memo": "мемо",
+STATUS = {"waiting": "в очереди", "transcribing": "транскрибация", "memo": "мемо", "compressing": "сжатие",
           "done": "готово", "error": "ошибка", "cancelled": "отменено"}
-ACTIVE = ("transcribing", "memo")
+ACTIVE = ("transcribing", "memo", "compressing")
 FINISHED = ("done", "error", "cancelled")
+
+# Сжатие повторяет настройки скилла video-compress из Arch Clean Maker: запись созвона OBS в H.264
+# при CQ 23 ужимается примерно до 10 % размера, на глаз как оригинал (проба 2026-10-03).
+COMPRESSED_SUFFIX = " (H.265)"
+COMPRESS_CQ = 23
+MIN_SAVING = 0.25  # если сжатый файл меньше оригинала не на четверть, он удаляется, а оригинал остаётся
+MODERN_CODECS = {"hevc": "уже H.265", "av1": "уже AV1", "vp9": "уже VP9"}
+FFMPEG_TIME = re.compile(r"^out_time_us=(\d+)")
+FFMPEG_SPEED = re.compile(r"^speed=\s*([\d.]+)x")
+FFMPEG_KEY = re.compile(r"^\w+=")
+COMPRESS_CHECK_SECONDS = 2
+QUEUE = "в очереди встреча, которой нужна транскрибация или мемо"  # сжатие ей уступает
 
 CLAUDE_TOOLS = "Read,Write,Edit,Glob,Grep,Skill"
 LOGIN_HINT = "Claude Code не авторизован: запустите claude в терминале и выполните /login."
@@ -100,6 +122,7 @@ MEMO_PROMPT = """Сделай мемо по транскрипции встре�
 В ответе дай имя сохранённого файла и то, что правила проекта велят сообщить после мемо."""
 
 CREATE_NO_WINDOW = 0x08000000
+BELOW_NORMAL_PRIORITY_CLASS = 0x4000
 GENERIC_READ = 0x80000000
 OPEN_EXISTING = 3
 ERROR_ALREADY_EXISTS = 183
@@ -133,10 +156,69 @@ def single_instance() -> bool:
 
 
 def list_videos(folder: Path) -> list[str]:
+    """Записи в папке. Сжатые копии "<имя> (H.265).mp4" новыми записями не считаются."""
     try:
-        return [str(p) for p in folder.iterdir() if p.is_file() and p.suffix.lower() in VIDEO_EXT]
+        return [str(p) for p in folder.iterdir()
+                if p.is_file() and p.suffix.lower() in VIDEO_EXT and not p.stem.endswith(COMPRESSED_SUFFIX)]
     except OSError:
         return []
+
+
+def compressed_path(video: Path) -> Path:
+    return video.with_name(f"{video.stem}{COMPRESSED_SUFFIX}.mp4")
+
+
+def has_file(job: dict, key: str) -> bool:
+    return bool(job.get(key)) and Path(job[key]).exists()
+
+
+def compression_pending(job: dict) -> bool:
+    return bool(job.get("compress")) and not has_file(job, "compressed") and not job.get("compress_skip")
+
+
+def compression_only(job: dict) -> bool:
+    """Транскрипция и мемо у встречи готовы, осталось только сжатие."""
+    return has_file(job, "transcript") and (not job["memo"] or has_file(job, "memo_file"))
+
+
+def probe_media(ffprobe: str, path: Path) -> dict | None:
+    """Кодек и номер видеодорожки, длительность и кодеки звука по ffprobe. None, если файл не читается."""
+    result = subprocess.run([ffprobe, "-v", "error", "-show_entries",
+                             "format=duration:stream=codec_type,codec_name,pix_fmt:stream_disposition=attached_pic",
+                             "-of", "json", str(path)],
+                            capture_output=True, text=True, encoding="utf-8", errors="replace",
+                            creationflags=CREATE_NO_WINDOW)
+    try:
+        data = json.loads(result.stdout)
+        duration = float(data["format"]["duration"])
+    except (ValueError, KeyError, TypeError):
+        return None
+    streams = data.get("streams", [])
+    videos = [s for s in streams if s.get("codec_type") == "video"]
+    # обложка в MP4 тоже видеодорожка, её не сжимаем
+    video = next((s for s in videos if not (s.get("disposition") or {}).get("attached_pic")), None)
+    return {"duration": duration, "codec": video["codec_name"] if video else "",
+            "pix_fmt": video.get("pix_fmt", "") if video else "", "video_index": videos.index(video) if video else 0,
+            "audio": [s.get("codec_name", "") for s in streams if s.get("codec_type") == "audio"]}
+
+
+def compress_cmd(ffmpeg: str, video: Path, target: Path, info: dict) -> list[str]:
+    """Сжатие в H.265 на видеокарте. Звук AAC копируется как есть, другой звук переводится в AAC."""
+    ten_bit = "10" in info["pix_fmt"]
+    cmd = [ffmpeg, "-hide_banner", "-nostdin", "-v", "error", "-y", "-i", str(video),
+           "-map", f"0:v:{info['video_index']}"]
+    for index, codec in enumerate(info["audio"]):
+        cmd += ["-map", f"0:a:{index}", f"-c:a:{index}"]
+        cmd += ["copy"] if codec == "aac" else ["aac", f"-b:a:{index}", "192k"]
+    return cmd + ["-fps_mode", "passthrough", "-c:v", "hevc_nvenc", "-preset", "p7", "-tune", "hq", "-rc", "vbr",
+                  "-cq", str(COMPRESS_CQ), "-b:v", "0", "-maxrate", "200M", "-bufsize", "400M", "-spatial-aq", "1",
+                  "-pix_fmt", "p010le" if ten_bit else "yuv420p", "-profile:v", "main10" if ten_bit else "main",
+                  "-tag:v", "hvc1", "-map_metadata", "0", "-movflags", "+faststart+use_metadata_tags",
+                  "-f", "mp4", "-progress", "pipe:1", "-nostats", str(target)]
+
+
+def same_duration(info: dict | None, duration: float) -> bool:
+    return bool(info) and abs(info["duration"] - duration) <= max(1.0, duration * 0.01)
 
 
 def default_name(video: Path) -> str:
@@ -158,9 +240,13 @@ def describe(video: Path) -> str:
                 parts.append(f"{container.duration / 1_000_000 / 60:.0f} мин")
     except Exception:  # длительность только для справки, без неё окно тоже работает
         pass
-    size = video.stat().st_size
-    parts.append(f"{size / 2**30:.1f} ГБ" if size >= 2**30 else f"{size / 2**20:.0f} МБ")
+    parts.append(size_text(video.stat().st_size))
     return ", ".join(parts)
+
+
+def size_text(size: float) -> str:
+    text = f"{size / 2**30:.1f} ГБ" if size >= 2**30 else f"{size / 2**20:.0f} МБ"
+    return text.replace(".", ",")
 
 
 def status_text(job: dict) -> str:
@@ -169,9 +255,16 @@ def status_text(job: dict) -> str:
         return f"транскрибация {job.get('progress', 0):.0%}"
     if status == "memo":
         return "мемо, работает Claude"
+    if status == "compressing":
+        return "сжатие ждёт" if job.get("compress_wait") else f"сжатие {job.get('progress', 0):.0%}"
+    if status == "waiting" and job.get("compress") and compression_only(job):
+        return "ждёт сжатия"
     if status == "done":
-        return "готово, есть мемо" if job.get("memo_file") else "готово"
+        text = "готово, есть мемо" if job.get("memo_file") else "готово"
+        return text + ", сжато" if job.get("compressed") else text
     if status == "error":
+        if job.get("compress") and compression_only(job):
+            return "сжатие не сделано"
         return "мемо не сделано" if job.get("transcript") else "ошибка"
     return STATUS[status]
 
@@ -244,7 +337,11 @@ def summary_text(job: dict) -> str:
     stats = job.get("claude_stats") or {}
     if stats:
         parts.append(f"мемо {minutes(stats['seconds'])}")
+    if job.get("compress_seconds"):
+        parts.append(f"сжатие {minutes(job['compress_seconds'])}")
     text = "Итог: " + ", ".join(parts) if parts else "Итог"
+    if job.get("compress_result"):
+        text += f". Видео: {job['compress_result']}"
     if stats:
         cost = f"{stats['cost']:.2f}".replace(".", ",")
         text += (f". Claude: шагов {stats['turns']}, токенов на входе {thousands(stats['input'])}"
@@ -399,6 +496,8 @@ class Store:
         self.last_out_dir: str = data.get("last_out_dir") or self.out_dirs[0]
         self.mode: str = data.get("mode", "fast")
         self.memo: bool = data.get("memo", True)
+        self.compress: bool = data.get("compress", False)
+        self.delete_original: bool = data.get("delete_original", False)
         self.claude_dir: str = data.get("claude_dir", "")
         self.journal_open: bool = data.get("journal_open", True)
         self.jobs: list[dict] = data.get("jobs", [])
@@ -423,6 +522,8 @@ class Store:
                 "last_out_dir": self.last_out_dir,
                 "mode": self.mode,
                 "memo": self.memo,
+                "compress": self.compress,
+                "delete_original": self.delete_original,
                 "claude_dir": self.claude_dir,
                 "journal_open": self.journal_open,
                 "known": sorted(self.known),
@@ -435,7 +536,7 @@ class Store:
 
 
 class Worker(threading.Thread):
-    """Обрабатывает очередь по одной встрече: транскрибация, затем мемо."""
+    """Обрабатывает очередь по одной встрече: транскрибация, затем мемо, затем сжатие видео."""
 
     def __init__(self, app: App) -> None:
         super().__init__(daemon=True)
@@ -462,8 +563,10 @@ class Worker(threading.Thread):
                 self.current, self.proc = None, None
 
     def next_job(self) -> dict | None:
+        """Первая ждущая встреча. Встречи, которым осталось только сжатие, пропускают вперёд остальные."""
         with self.store.lock:
-            return next((job for job in self.store.jobs if job["status"] == "waiting"), None)
+            waiting = [job for job in self.store.jobs if job["status"] == "waiting"]
+            return next((job for job in waiting if not compression_only(job)), waiting[0] if waiting else None)
 
     def update(self, job: dict, save: bool = True, **fields: object) -> None:
         with self.store.lock:
@@ -498,14 +601,16 @@ class Worker(threading.Thread):
 
     def process(self, job: dict) -> None:
         name = job["name"]
-        if not (job.get("transcript") and Path(job["transcript"]).exists()):
-            if not Path(job["video"]).exists():
+        if not has_file(job, "transcript"):
+            # если оригинал удалён после сжатия, транскрипция делается заново по сжатому файлу
+            source = next((Path(job[key]) for key in ("video", "compressed") if has_file(job, key)), None)
+            if source is None:
                 self.log(job, f"Нет файла записи: {job['video']}", "error")
                 self.update(job, status="error", note=f"нет файла: {job['video']}")
                 return
             self.update(job, status="transcribing", progress=0.0, note="")
             started = time.time()
-            transcript = self.transcribe(job)
+            transcript = self.transcribe(job, source)
             if self.cancelled:
                 self.log(job, "Транскрибация прервана", "error")
                 self.update(job, status="cancelled")
@@ -522,7 +627,7 @@ class Worker(threading.Thread):
             self.log(job, f"Транскрипция готова за {minutes(job['transcribe_seconds'])}: {transcript.name}", "stage")
             self.update(job, transcript=str(transcript))
             self.app.post("notify", "Транскрибация готова", name)
-        if job["memo"]:
+        if job["memo"] and not has_file(job, "memo_file"):
             self.update(job, status="memo", claude_stats={})
             done = self.make_memo(job)
             if self.cancelled:
@@ -536,12 +641,28 @@ class Worker(threading.Thread):
                 self.app.post("notify", "Мемо не сделано", f"{name}. {job['note'][:120]}")
                 return
             self.app.post("notify", "Мемо готово", name)
+        if compression_pending(job):
+            outcome = self.compress(job)
+            self.update(job, save=False, compress_wait="")
+            if self.cancelled:
+                self.log(job, "Сжатие прервано, оригинал не тронут", "error")
+                self.update(job, status="cancelled")
+                return
+            if outcome == QUEUE:
+                self.log(job, "Сжатие подождёт: сначала транскрибация других встреч из очереди", "stage")
+                self.update(job, status="waiting", progress=0.0)
+                return
+            if outcome is None:
+                self.log(job, f"Сжатие не удалось, оригинал не тронут. {job['note']}", "error")
+                self.update(job, status="error")
+                self.app.post("notify", "Сжатие не удалось", name)
+                return
         self.log(job, summary_text(job), "summary")
         self.update(job, status="done")
 
-    def transcribe(self, job: dict) -> Path | None:
+    def transcribe(self, job: dict, source: Path) -> Path | None:
         target = Path(job["out_dir"]) / f"{job['name']}.txt"
-        cmd = [console_python(), "-u", str(TRANSCRIBE), job["video"], "--name", job["name"],
+        cmd = [console_python(), "-u", str(TRANSCRIBE), str(source), "--name", job["name"],
                "--out", job["out_dir"], "--mode", job["mode"]]
         env = dict(os.environ, PYTHONIOENCODING="utf-8")
         log: list[str] = []
@@ -663,6 +784,173 @@ class Worker(threading.Thread):
         if done:
             self.log(job, "Ответ Claude:\n" + reply.strip(), "reply")
         return done
+
+    # --- сжатие видео ---
+
+    def compress(self, job: dict) -> str | None:
+        """Сжимает запись в H.265 рядом с оригиналом и по желанию удаляет оригинал.
+
+        Возвращает "done", в том числе когда сжимать нечего (причина в журнале), QUEUE, если сжатие
+        уступило очередь другой встрече, и None при ошибке, текст ошибки в job["note"].
+        """
+        video = Path(job["video"])
+        ffmpeg, ffprobe = shutil.which("ffmpeg"), shutil.which("ffprobe")
+        if not video.exists():
+            return self.skip_compression(job, f"нет файла записи {video}")
+        if not (ffmpeg and ffprobe):
+            job["note"] = "Не найден ffmpeg: установите его и добавьте папку с ffmpeg.exe в PATH."
+            return None
+        info = probe_media(ffprobe, video)
+        if info is None:
+            job["note"] = f"ffprobe не смог прочитать {video.name}"
+            return None
+        if not info["codec"]:
+            return self.skip_compression(job, "в файле нет видео")
+        if info["codec"] in MODERN_CODECS:
+            return self.skip_compression(job, f"видео {MODERN_CODECS[info['codec']]}")
+
+        target = compressed_path(video)
+        existing = probe_media(ffprobe, target) if target.exists() else None
+        if existing and existing["codec"] == "hevc" and same_duration(existing, info["duration"]):
+            self.log(job, f"Сжатая копия уже есть: {target.name}", "stage")
+        else:
+            outcome = self.encode(job, ffmpeg, video, target, info)
+            if outcome != "done":
+                return outcome
+            if not same_duration(probe_media(ffprobe, target), info["duration"]):
+                target.unlink(missing_ok=True)
+                job["note"] = "у сжатого файла другая длительность, он удалён"
+                return None
+
+        original_size, new_size = video.stat().st_size, target.stat().st_size
+        share = new_size / original_size
+        if share > 1 - MIN_SAVING:
+            target.unlink(missing_ok=True)
+            return self.skip_compression(job, f"не выгодно, сжатый файл {share:.0%} от оригинала")
+        result = f"{size_text(original_size)} → {size_text(new_size)} ({share:.0%})"
+        if job.get("delete_original"):
+            # полное декодирование дольше быстрой проверки, поэтому только когда оригинал будет удалён
+            self.log(job, "Проверка сжатого файла перед удалением оригинала: декодирование целиком", live=True)
+            problem = self.verify(ffmpeg, target)
+            if self.cancelled:
+                return None
+            if problem:
+                target.unlink(missing_ok=True)
+                job["note"] = problem
+                return None
+            try:
+                video.unlink()
+                result += ", оригинал удалён"
+            except OSError as error:
+                result += f", оригинал удалить не удалось: {error}"
+        with self.store.lock:
+            job["compressed"], job["compress_result"] = str(target), result
+        self.log(job, f"Видео сжато: {result}. Файл {target}", "stage")
+        self.app.post("notify", "Сжатие готово", f"{job['name']}: {result}")
+        return "done"
+
+    def encode(self, job: dict, ffmpeg: str, video: Path, target: Path, info: dict) -> str | None:
+        """Запускает ffmpeg, пока видеокарта никому не нужна. Результат пишется в .part и появляется готовым."""
+        partial = target.with_name(target.name + ".part")
+        cmd = compress_cmd(ffmpeg, video, partial, info)
+        total_us = info["duration"] * 1_000_000
+        while True:
+            self.update(job, status="compressing", progress=0.0)
+            reason = self.wait_for_gpu(job)
+            if reason == QUEUE or self.cancelled:
+                return reason
+            self.log(job, f"Сжатие в H.265 началось: {video.name}, {size_text(video.stat().st_size)}", "stage")
+            started = checked = time.time()
+            log: list[str] = []
+            speed, stopped = "", None
+            self.proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+                                         encoding="utf-8", errors="replace",
+                                         creationflags=CREATE_NO_WINDOW | BELOW_NORMAL_PRIORITY_CLASS)
+            if self.cancelled:
+                self.proc.kill()
+            for line in self.proc.stdout:
+                line = line.strip()
+                if match := FFMPEG_SPEED.match(line):
+                    speed = f", скорость {float(match.group(1)):.1f}×".replace(".", ",")
+                elif match := FFMPEG_TIME.match(line):
+                    progress = min(int(match.group(1)) / total_us, 1.0) if total_us else 0.0
+                    self.update(job, save=False, progress=progress)
+                    self.log(job, f"Сжато {progress:.0%}{speed}", live=True)
+                elif line and not FFMPEG_KEY.match(line):
+                    log.append(line)
+                # видеокарта понадобилась записи или транскрибации: сжатие остановится и потом начнётся заново
+                if stopped is None and time.time() - checked >= COMPRESS_CHECK_SECONDS:
+                    checked = time.time()
+                    stopped = self.compress_blocker(job)
+                    if stopped:
+                        self.proc.kill()
+            code = self.proc.wait()
+            if self.cancelled or stopped:
+                partial.unlink(missing_ok=True)
+                if self.cancelled:
+                    return None
+                self.log(job, f"Сжатие остановлено, потом начнётся заново: {stopped}", "stage")
+                continue
+            if code != 0 or not partial.exists():
+                partial.unlink(missing_ok=True)
+                job["note"] = log[-1] if log else f"ffmpeg завершился с кодом {code}"
+                return None
+            stat = video.stat()
+            os.replace(partial, target)
+            os.utime(target, (stat.st_atime, stat.st_mtime))  # дата как у записи, проводник сортирует по ней
+            job["compress_seconds"] = time.time() - started
+            return "done"
+
+    def compress_blocker(self, job: dict) -> str | None:
+        """Почему сжатию сейчас лучше не занимать видеокарту, или None."""
+        with self.store.lock:
+            if any(other is not job and other["status"] == "waiting" and not compression_only(other)
+                   for other in self.store.jobs):
+                return QUEUE
+        if self.app.recording():
+            return "OBS пишет новую запись"
+        if self.app.dialog is not None:
+            return "открыто окно новой записи"
+        return None
+
+    def wait_for_gpu(self, job: dict) -> str | None:
+        """Ждёт, пока закончится запись и закроется окно новой записи.
+
+        Возвращает QUEUE, если сжатие должно уступить очередь, и None, когда можно сжимать
+        или сжатие отменили.
+        """
+        while not self.cancelled:
+            reason = self.compress_blocker(job)
+            if reason is None or reason == QUEUE:
+                self.update(job, save=False, compress_wait="")
+                return reason
+            if job.get("compress_wait") != reason:
+                self.update(job, save=False, compress_wait=reason)
+                self.log(job, f"Сжатие ждёт: {reason}")
+            time.sleep(COMPRESS_CHECK_SECONDS)
+        return None
+
+    def verify(self, ffmpeg: str, path: Path) -> str | None:
+        """Ошибки полного декодирования сжатого файла или None."""
+        self.proc = subprocess.Popen([ffmpeg, "-hide_banner", "-nostdin", "-v", "error", "-hwaccel", "cuda",
+                                      "-i", str(path), "-f", "null", "-"],
+                                     stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True,
+                                     encoding="utf-8", errors="replace",
+                                     creationflags=CREATE_NO_WINDOW | BELOW_NORMAL_PRIORITY_CLASS)
+        _, stderr = self.proc.communicate()
+        # предупреждения о метках времени у записей с переменной частотой кадров файл не портят
+        errors = [line for line in stderr.splitlines()
+                  if line.strip() and "non monotonically increasing dts" not in line
+                  and not line.startswith("[null @") and "Last message repeated" not in line]
+        if self.proc.returncode or errors:
+            return "сжатый файл декодируется с ошибками: " + (" ".join(errors)[-200:] or f"код {self.proc.returncode}")
+        return None
+
+    def skip_compression(self, job: dict, reason: str) -> str:
+        with self.store.lock:
+            job["compress_skip"], job["compress_result"] = reason, f"не сжато, {reason}"
+        self.log(job, f"Сжатие пропущено: {reason}", "stage")
+        return "done"
 
 
 class App:
@@ -1045,10 +1333,18 @@ class App:
         finally:
             self.root.after(SCAN_MS, self.scan)
 
+    def recording(self) -> bool:
+        """OBS пишет новую запись: в папке наблюдения есть новый файл, который ещё растёт или открыт."""
+        return self.store.watch and bool(self.candidates)
+
     def check_folder(self) -> None:
         """Запись считается законченной, когда файл не растёт и его никто не держит открытым."""
         now = time.time()
-        for path in list_videos(self.store.watch_dir):
+        videos = list_videos(self.store.watch_dir)
+        # пропавший файл не должен навсегда считаться идущей записью, иначе сжатие будет ждать вечно
+        for path in set(self.candidates) - set(videos):
+            del self.candidates[path]
+        for path in videos:
             if path in self.store.known or path in self.asked:
                 continue
             try:
@@ -1123,13 +1419,30 @@ class App:
         ttk.Checkbutton(body, text="Сделать мемо через Claude", variable=memo, style="Switch.TCheckbutton").grid(
             row=5, column=1, columnspan=2, sticky="w", pady=(12, 0))
 
+        is_video = video.suffix.lower() in VIDEO_EXT
+        compress = tk.BooleanVar(value=self.store.compress and is_video)
+        delete_original = tk.BooleanVar(value=self.store.delete_original)
+        ttk.Checkbutton(body, text="Сжать видео в H.265 после транскрибации", variable=compress,
+                        style="Switch.TCheckbutton", state="normal" if is_video else "disabled",
+                        command=lambda: delete_box.config(state="normal" if compress.get() else "disabled")).grid(
+            row=6, column=1, columnspan=2, sticky="w", pady=(10, 0))
+        hint = (f"Рядом с записью появится «{compressed_path(video).name}», обычно около 10 % размера."
+                if is_video else "Это аудиофайл, сжимать нечего.")
+        ttk.Label(body, text=hint, foreground=self.muted).grid(row=7, column=1, columnspan=2, sticky="w",
+                                                               padx=(48, 0), pady=(2, 0))
+        delete_box = ttk.Checkbutton(body, text="Удалить оригинал после проверки сжатого, безвозвратно",
+                                     variable=delete_original,
+                                     state="normal" if compress.get() else "disabled")
+        delete_box.grid(row=8, column=1, columnspan=2, sticky="w", padx=(44, 0), pady=(6, 0))
+
         def finish(accepted: bool) -> None:
             if accepted:
                 clean = sanitize(name.get())
                 if not clean:
                     messagebox.showwarning("Новая запись", "Введите название.", parent=dialog)
                     return
-                self.enqueue(video, clean, folder.get(), mode.get(), memo.get())
+                self.enqueue(video, clean, folder.get(), mode.get(), memo.get(),
+                             compress.get(), delete_original.get(), remember_compress=is_video)
             dialog.destroy()
             self.dialog = None
             with self.store.lock:
@@ -1139,7 +1452,7 @@ class App:
                 self.root.after(300, lambda: self.ask(self.prompts.popleft()))
 
         actions = ttk.Frame(body)
-        actions.grid(row=6, column=0, columnspan=3, sticky="e", pady=(18, 0))
+        actions.grid(row=9, column=0, columnspan=3, sticky="e", pady=(18, 0))
         self.button(actions, "В очередь", "play", lambda: finish(True), accent=True).pack(side="left", padx=(0, 8))
         self.button(actions, "Пропустить", "remove", lambda: finish(False)).pack(side="left")
         dialog.protocol("WM_DELETE_WINDOW", lambda: finish(False))
@@ -1156,21 +1469,28 @@ class App:
         entry.focus_set()
         entry.icursor("end")
 
-    def enqueue(self, video: Path, name: str, out_dir: str, mode: str, memo: bool) -> None:
+    def enqueue(self, video: Path, name: str, out_dir: str, mode: str, memo: bool, compress: bool,
+                delete_original: bool, remember_compress: bool = True) -> None:
         with self.store.lock:
             taken = {(job["out_dir"], job["name"]) for job in self.store.jobs if job["status"] != "cancelled"}
             base, number = name, 2
             while (out_dir, name) in taken or (Path(out_dir) / f"{name}.txt").exists():
                 name, number = f"{base} ({number})", number + 1
-            plan = "транскрибация и мемо" if memo else "только транскрибация"
+            plan = "транскрибация" + (", мемо" if memo else "") + (", сжатие видео" if compress else "")
+            if compress and delete_original:
+                plan += " с удалением оригинала"
             self.store.jobs.append({
                 "id": uuid.uuid4().hex[:8], "video": str(video), "name": name, "out_dir": out_dir,
-                "mode": mode, "memo": memo, "status": "waiting", "progress": 0.0, "transcript": "",
-                "memo_file": "", "note": "", "log": [], "added": datetime.now().isoformat(timespec="seconds"),
+                "mode": mode, "memo": memo, "compress": compress, "delete_original": compress and delete_original,
+                "status": "waiting", "progress": 0.0, "transcript": "", "memo_file": "", "compressed": "",
+                "note": "", "log": [], "added": datetime.now().isoformat(timespec="seconds"),
                 "journal": [[f"{datetime.now():%H:%M:%S}", "stage",
                              f"Поставлена в очередь: {plan}, сохранить в {out_dir}"]],
             })
             self.store.last_out_dir, self.store.mode, self.store.memo = out_dir, mode, memo
+            # для аудиофайла переключатель сжатия выключен, его выбор не запоминается
+            if remember_compress:
+                self.store.compress, self.store.delete_original = compress, delete_original
             self.store.save()
         self.sync_out_dirs()
         self.worker.wake.set()
@@ -1209,24 +1529,33 @@ class App:
         self.refresh()
 
     def retry(self) -> None:
-        """Повторяет то, что не получилось. Готовая транскрипция не пересчитывается."""
+        """Повторяет то, что не получилось. Готовые транскрипция и сжатие не повторяются.
+
+        Если всё уже сделано, мемо делается заново, а если его не заказывали, делается впервые.
+        """
         job = self.selected()
         if job is None or job["status"] in ACTIVE + ("waiting",):
             return
-        has_transcript = bool(job.get("transcript")) and Path(job["transcript"]).exists()
-        has_memo = bool(job.get("memo_file")) and Path(job["memo_file"]).exists()
-        if has_transcript and has_memo and not messagebox.askyesno(
+        has_transcript = has_file(job, "transcript")
+        has_memo = has_file(job, "memo_file")
+        compress_left = compression_pending(job)
+        redo_memo = has_transcript and not compress_left and (has_memo or not job["memo"])
+        if redo_memo and has_memo and not messagebox.askyesno(
                 TITLE, "Мемо уже есть. Сделать его заново?", parent=self.root):
             return
         with self.store.lock:
             if not has_transcript:
-                job["transcript"] = ""
-            elif has_memo or not job["memo"]:
+                job["transcript"], job["memo_file"] = "", ""
+            elif redo_memo:
                 job["memo"], job["memo_file"] = True, ""
             job.update(status="waiting", progress=0.0, note="")
             self.store.save()
-        self.worker.log(job, "Повтор: " + ("мемо заново" if has_transcript else "транскрибация и мемо заново"),
-                        "stage")
+        stages = [] if has_transcript else ["транскрибация"]
+        if job["memo"] and not has_file(job, "memo_file"):
+            stages.append("мемо")
+        if compress_left:
+            stages.append("сжатие видео")
+        self.worker.log(job, "Повтор: " + ", ".join(stages), "stage")
         self.worker.wake.set()
         self.refresh()
 
@@ -1315,6 +1644,8 @@ class App:
             f"Статус: {status_text(job)}",
             f"Транскрипция: {job.get('transcript') or 'нет'}",
             f"Мемо: {job.get('memo_file') or 'нет'}",
+            f"Сжатое видео: {job.get('compressed') or 'нет'}"
+            + (f" ({job['compress_result']})" if job.get("compress_result") else ""),
             "",
             "Ответ Claude или сообщение об ошибке:",
             job.get("note") or "нет",
