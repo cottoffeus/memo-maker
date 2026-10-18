@@ -608,24 +608,31 @@ class Worker(threading.Thread):
                 self.log(job, f"Нет файла записи: {job['video']}", "error")
                 self.update(job, status="error", note=f"нет файла: {job['video']}")
                 return
-            self.update(job, status="transcribing", progress=0.0, note="")
-            started = time.time()
-            transcript = self.transcribe(job, source)
-            if self.cancelled:
-                self.log(job, "Транскрибация прервана", "error")
-                self.update(job, status="cancelled")
-                return
-            if transcript is None:
-                hint = error_hint(job["note"])
-                if hint:
-                    job["note"] = f"{hint}\n\n{job['note']}"
-                self.log(job, f"Транскрибация не удалась. {job['note']}", "error")
-                self.update(job, status="error")
-                self.app.post("notify", "Ошибка транскрибации", name)
-                return
-            job["transcribe_seconds"] = time.time() - started
-            self.log(job, f"Транскрипция готова за {minutes(job['transcribe_seconds'])}: {transcript.name}", "stage")
-            self.update(job, transcript=str(transcript))
+            ready = Path(job["out_dir"]) / f"{job['name']}.txt"
+            if ready.exists():
+                # transcribe.py пишет в .part и переименовывает в .txt только готовый файл, поэтому
+                # найденная транскрипция целая: её оставил прошлый запуск, упавший уже после записи
+                self.log(job, f"Транскрипция уже записана прошлым запуском, используется: {ready.name}", "stage")
+                self.update(job, status="transcribing", progress=1.0, note="", transcript=str(ready))
+            else:
+                self.update(job, status="transcribing", progress=0.0, note="")
+                started = time.time()
+                transcript = self.transcribe(job, source)
+                if self.cancelled:
+                    self.log(job, "Транскрибация прервана", "error")
+                    self.update(job, status="cancelled")
+                    return
+                if transcript is None:
+                    hint = error_hint(job["note"])
+                    if hint:
+                        job["note"] = f"{hint}\n\n{job['note']}"
+                    self.log(job, f"Транскрибация не удалась. {job['note']}", "error")
+                    self.update(job, status="error")
+                    self.app.post("notify", "Ошибка транскрибации", name)
+                    return
+                job["transcribe_seconds"] = time.time() - started
+                self.log(job, f"Транскрипция готова за {minutes(job['transcribe_seconds'])}: {transcript.name}", "stage")
+                self.update(job, transcript=str(transcript))
             self.app.post("notify", "Транскрибация готова", name)
         if job["memo"] and not has_file(job, "memo_file"):
             self.update(job, status="memo", claude_stats={})
@@ -672,6 +679,7 @@ class Worker(threading.Thread):
                                      creationflags=CREATE_NO_WINDOW)
         if self.cancelled:
             self.proc.kill()
+        written = False  # путь к готовому файлу transcribe.py печатает последней строкой
         for line in self.proc.stdout:
             line = line.strip()
             match = PROGRESS.match(line)
@@ -680,14 +688,20 @@ class Worker(threading.Thread):
                 self.log(job, f"Распознано {line}", live=True)
             elif line:
                 log.append(line)
-                if not line.startswith(job["out_dir"]):
+                if line == str(target):
+                    written = True
+                elif not line.startswith(job["out_dir"]):
                     self.log(job, line, live=True)
         code = self.proc.wait()
         with self.store.lock:
             job["log"] = log[-40:]
-            if code == 0 and target.exists():
+            if target.exists() and (code == 0 or written):
+                if code != 0:
+                    # файл целый, упала только выгрузка CUDA-библиотек на выходе из процесса
+                    self.log(job, f"transcribe.py завершился с кодом {code:#x} уже после записи файла")
                 return target
-            job["note"] = log[-1] if log else f"код возврата {code}"
+            reason = next((entry for entry in reversed(log) if not entry.startswith(job["out_dir"])), "")
+            job["note"] = f"код возврата {code:#x}. {reason}".strip()
         return None
 
     def make_memo(self, job: dict) -> bool:

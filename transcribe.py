@@ -215,8 +215,11 @@ def main() -> int:
 
     elapsed = time.time() - started
     print(f"\nГотово: {count} фраз, {info.duration / 60:.0f} мин записи за {elapsed / 60:.1f} мин")
-    print(target)
-    return 0
+    print(target, flush=True)
+    # Транскрипция записана. Дальше интерпретатор выгружал бы модель и CUDA-библиотеки, а на этом
+    # ctranslate2 иногда падает (исключение C++ в KERNELBASE, затем код 0xC0000409): процесс
+    # завершается с ошибкой, хотя работа сделана. Поэтому выход сразу, без разгрузки.
+    os._exit(0)
 
 
 if __name__ == "__main__":
